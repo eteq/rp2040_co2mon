@@ -219,7 +219,7 @@ int update_buffer_with_measurements(bool degc,  uint16_t co2ppm, float tC, float
         temp = tC;
     } else {
         tchar = 'F';
-        temp = temp*9./5. + 32;
+        temp = tC*9./5. + 32;
         tdp = tdp*9./5. + 32;
     }
 
