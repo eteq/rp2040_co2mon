@@ -227,18 +227,18 @@ int update_buffer_with_measurements(bool degc,  uint16_t co2ppm, float tC, float
     for (int i=0; i<nchar; i++) { char_to_buffer(s[i], i*8+1, 51); }
 
     nchar = sprintf(s, "T: %.1f deg%c", temp, tchar);
-    for (int i=0; i<nchar; i++) { char_to_buffer(s[i], i*8+1, 41); }
+    for (int i=0; i<nchar; i++) { char_to_buffer(s[i], i*8+1, 31); }
     
     nchar = sprintf(s, "RH: %.1f %%", RH);
-    for (int i=0; i<nchar; i++) { char_to_buffer(s[i], i*8+1, 31); }
+    for (int i=0; i<nchar; i++) { char_to_buffer(s[i], i*8+1, 21); }
 
     nchar = sprintf(s, "Tdp: %.1f deg%c", tdp, tchar);
-    for (int i=0; i<nchar; i++) { char_to_buffer(s[i], i*8+1, 21); }
+    for (int i=0; i<nchar; i++) { char_to_buffer(s[i], i*8+1, 11); }
 
     if (co2ppm < 1000) { nchar = sprintf(s, "Safe CO2"); }
     else if (co2ppm < 2000) { nchar = sprintf(s, "Iffy CO2?"); }
     else { nchar = sprintf(s, "Unsafe CO2!"); }
-    for (int i=0; i<nchar; i++) { char_to_buffer(s[i], i*8 + (128 - nchar*8)/2, 11); }
+    for (int i=0; i<nchar; i++) { char_to_buffer(s[i], i*8 + (128 - nchar*8)/2, 41); }
 
     return res;
 }
