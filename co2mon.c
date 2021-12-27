@@ -31,12 +31,18 @@
 
 #define SCD41_ADDR 0x62
 
-#define WAIT_TIME_MS 5000
+#define SLEEP_TIME_MS 5
+#define MEASUREMENT_PERIOD_MS 5000
 
 #define CRC_ERROR -10
 
 
+// global state
 bool display_buffer[WIDTH][HEIGHT];
+bool degc = true;
+bool redraw = false;
+bool remeasure = false;
+struct repeating_timer redraw_timer;
 
 int write_display_buffer() {
     int thisret, ret = 0;
@@ -198,33 +204,21 @@ float dewpoint_from_t_rh( float tC, float RH) {
     return 243.04*(logrh+(tnumer/tdenom))/(17.625-logrh-(tnumer/tdenom));
 }
 
-int update_buffer_with_measurements(bool degc) {
+int update_buffer_with_measurements(bool degc,  uint16_t co2ppm, float tC, float RH) {
     int res;
-    uint16_t co2ppm;
-    uint16_t words[3];
+    char tchar;
+    float temp;
 
-        printf("top");
     int nchar;
     char s[40];
-    
-    char tchar;
+
+    float tdp = dewpoint_from_t_rh(tC, RH);
+
     if (degc) {
         tchar = 'C';
+        temp = tC;
     } else {
         tchar = 'F';
-    } 
-
-    res = scd41_read(0xec05, words, 3, 1);
-    
-    if (res == PICO_ERROR_GENERIC) {return res; } 
-    
-
-    co2ppm = words[0];
-    float temp = 175. * (float)words[1] / 65536. - 45.;
-    float RH = 100. * (float)words[2] / 65536.;
-    float tdp = dewpoint_from_t_rh(temp, RH);
-
-    if (!degc) {
         temp = temp*9./5. + 32;
         tdp = tdp*9./5. + 32;
     }
@@ -244,12 +238,25 @@ int update_buffer_with_measurements(bool degc) {
     return res;
 }
 
+void buttons_callback(uint gpio, uint32_t events) {
+    // only triggered on falling.
+    degc = !degc;
+    redraw = true;
+}
+
+bool redraw_timer_callback(struct repeating_timer *t) {
+    redraw = true;
+    remeasure = true;
+    return true;
+}
 
 int main() {
     bi_decl(bi_program_description("This is a co2 monitor binary."));
     bi_decl(bi_1pin_with_name(LED_GPIO, "On-board LED"));
+
     
-    bool degc = true;
+    uint16_t co2ppm;
+    float tempC, rh;
 
     stdio_init_all();
 
@@ -257,8 +264,19 @@ int main() {
     gpio_set_dir(LED_GPIO, GPIO_OUT);
     gpio_put(LED_GPIO, 1);
 
+    // featherwing buttons
+    for (int pinnum=7; pinnum<10; pinnum++) {
+        gpio_init(pinnum);
+        gpio_set_dir(pinnum, GPIO_IN);
+        gpio_pull_up(pinnum);
+        // FALL is when the button is pushed
+        gpio_set_irq_enabled_with_callback(pinnum, GPIO_IRQ_EDGE_FALL, true, &buttons_callback);
+    }
+
     printf("Getting display Ready\n");
     setup_display();
+    clear_buffer();
+    write_display_buffer();
 
     // stop measuring SCD41 if it is already
     scd41_sendcommand(0x3f86, 500);
@@ -267,7 +285,7 @@ int main() {
 
     //start measuring SCD41
     scd41_sendcommand(0x21b1, 0);
-     
+    add_repeating_timer_ms(MEASUREMENT_PERIOD_MS, redraw_timer_callback, NULL, &redraw_timer);
 
     // this indicates startup
     for (int i=0; i < 5; i++) {
@@ -278,13 +296,37 @@ int main() {
     }
 
     while (true) {
-        clear_buffer();
-        update_buffer_with_measurements(degc);
+        if (remeasure) {
+            int res;
+            uint16_t words[3];
 
-        write_display_buffer();
+            res = scd41_read(0xec05, words, 3, 1);
+            if (res == PICO_ERROR_GENERIC) {
+                printf("measurement error!");
 
-        sleep_ms(WAIT_TIME_MS);
+                gpio_put(LED_GPIO, 1);
+                sleep_ms(250);
+                gpio_put(LED_GPIO, 0);
+                sleep_ms(250);
+            } else {
+                printf("arg");
+            }
 
+            co2ppm = words[0];
+            tempC = 175. * (float)words[1] / 65536. - 45.;
+            rh = 100. * (float)words[2] / 65536.;
+
+            remeasure = false;
+        }
+
+        if (redraw) {
+            clear_buffer();
+            update_buffer_with_measurements(degc, co2ppm, tempC, rh);
+            write_display_buffer();
+            redraw = false;
+        }
+
+        sleep_ms(SLEEP_TIME_MS);
     }
 
     return 0;
