@@ -190,10 +190,66 @@ void setup_display() {
     i2c_write_blocking(WHICH_I2C, DISPLAY_ADDR, display_on, 2, false);
 }
 
+float dewpoint_from_t_rh( float tC, float RH) {
+    float logrh = log(RH/100);
+    float tnumer = 17.625*tC;
+    float tdenom = 243.04 + tC;
+    // August–Roche–Magnus formula assumption for Es
+    return 243.04*(logrh+(tnumer/tdenom))/(17.625-logrh-(tnumer/tdenom));
+}
+
+int update_buffer_with_measurements(bool degc) {
+    int res;
+    uint16_t co2ppm;
+    uint16_t words[3];
+
+        printf("top");
+    int nchar;
+    char s[40];
+    
+    char tchar;
+    if (degc) {
+        tchar = 'C';
+    } else {
+        tchar = 'F';
+    } 
+
+    res = scd41_read(0xec05, words, 3, 1);
+    
+    if (res == PICO_ERROR_GENERIC) {return res; } 
+    
+
+    co2ppm = words[0];
+    float temp = 175. * (float)words[1] / 65536. - 45.;
+    float RH = 100. * (float)words[2] / 65536.;
+    float tdp = dewpoint_from_t_rh(temp, RH);
+
+    if (!degc) {
+        temp = temp*9./5. + 32;
+        tdp = tdp*9./5. + 32;
+    }
+
+    nchar = sprintf(s, "CO2: %i ppm", co2ppm);
+    for (int i=0; i<nchar; i++) { char_to_buffer(s[i], i*8+1, 51); }
+
+    nchar = sprintf(s, "T: %.1f deg%c", temp, tchar);
+    for (int i=0; i<nchar; i++) { char_to_buffer(s[i], i*8+1, 41); }
+    
+    nchar = sprintf(s, "RH: %.1f %%", RH);
+    for (int i=0; i<nchar; i++) { char_to_buffer(s[i], i*8+1, 31); }
+
+    nchar = sprintf(s, "Tdp: %.1f deg%c", tdp, tchar);
+    for (int i=0; i<nchar; i++) { char_to_buffer(s[i], i*8+1, 21); }
+
+    return res;
+}
+
 
 int main() {
     bi_decl(bi_program_description("This is a co2 monitor binary."));
     bi_decl(bi_1pin_with_name(LED_GPIO, "On-board LED"));
+    
+    bool degc = true;
 
     stdio_init_all();
 
@@ -203,6 +259,11 @@ int main() {
 
     printf("Getting display Ready\n");
     setup_display();
+
+    // stop measuring SCD41 if it is already
+    scd41_sendcommand(0x3f86, 500);
+    //re-init just in case it isn't
+    scd41_sendcommand(0x3646, 1020);
 
     //start measuring SCD41
     scd41_sendcommand(0x21b1, 0);
@@ -218,27 +279,7 @@ int main() {
 
     while (true) {
         clear_buffer();
-
-        uint16_t words[3];
-
-        scd41_read(0xec05, words, 3, 1);
-
-        uint16_t co2ppm = words[0];
-        float tC = 175. * (float)words[1] / 65536. - 45.;
-        float RH = 100. * (float)words[2] / 65536.;
-
-        int nchar;
-        char s[40];
-        
-
-        nchar = sprintf(s, "CO2: %i ppm", co2ppm);
-        for (int i=0; i<nchar; i++) { char_to_buffer(s[i], i*8+1, 41); }
-
-        nchar = sprintf(s, "T: %.1f degC", tC);
-        for (int i=0; i<nchar; i++) { char_to_buffer(s[i], i*8+1, 31); }
-        
-        nchar = sprintf(s, "RH: %.1f %%", RH);
-        for (int i=0; i<nchar; i++) { char_to_buffer(s[i], i*8+1, 21); }
+        update_buffer_with_measurements(degc);
 
         write_display_buffer();
 
