@@ -204,15 +204,13 @@ float dewpoint_from_t_rh( float tC, float RH) {
     return 243.04*(logrh+(tnumer/tdenom))/(17.625-logrh-(tnumer/tdenom));
 }
 
-int update_buffer_with_measurements(bool degc,  uint16_t co2ppm, float tC, float RH) {
+int update_buffer_with_measurements(bool degc,  uint16_t co2ppm, float tC, float RH, float tdp) {
     int res;
     char tchar;
     float temp;
 
     int nchar;
     char s[40];
-
-    float tdp = dewpoint_from_t_rh(tC, RH);
 
     if (degc) {
         tchar = 'C';
@@ -261,7 +259,7 @@ int main() {
 
     
     uint16_t co2ppm;
-    float tempC, rh;
+    float tempC, rh, tdpC;
 
     stdio_init_all();
 
@@ -313,22 +311,24 @@ int main() {
                 sleep_ms(250);
                 gpio_put(LED_GPIO, 0);
                 sleep_ms(250);
-            } else {
-                printf("arg");
-            }
+            } 
 
             co2ppm = words[0];
             tempC = 175. * (float)words[1] / 65536. - 45.;
             rh = 100. * (float)words[2] / 65536.;
+            tdpC = dewpoint_from_t_rh(tempC, rh);
 
             remeasure = false;
         }
 
         if (redraw) {
             clear_buffer();
-            update_buffer_with_measurements(degc, co2ppm, tempC, rh);
+            update_buffer_with_measurements(degc, co2ppm, tempC, rh, tdpC);
             write_display_buffer();
             redraw = false;
+
+            uint32_t timestamp = to_ms_since_boot(get_absolute_time());
+            printf("tstampms,CO2ppm,TC,Rh%%,TdpC:%i,%i,%.1f,%.1f,%.1f\n", timestamp, co2ppm, tempC, rh, tdpC);
         }
 
         sleep_ms(SLEEP_TIME_MS);
