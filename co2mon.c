@@ -31,10 +31,11 @@
 
 #define SCD41_ADDR 0x62
 
+#define CRC_ERROR -10
+
 #define SLEEP_TIME_MS 5
 #define MEASUREMENT_PERIOD_MS 5000
-
-#define CRC_ERROR -10
+#define STORED_DATA_SIZE 5000  //20 bytes per item, so mutiple these by .02 to get the ram usage in kB
 
 
 // global state
@@ -42,7 +43,18 @@ bool display_buffer[WIDTH][HEIGHT];
 bool degc = true;
 bool redraw = false;
 bool remeasure = false;
+int writing = 0;
 struct repeating_timer redraw_timer;
+
+int stored_data_idx = 0;
+uint32_t times[STORED_DATA_SIZE];
+float co2ppms[STORED_DATA_SIZE];
+float temps[STORED_DATA_SIZE];
+float rhs[STORED_DATA_SIZE]; 
+float tdps[STORED_DATA_SIZE];
+int write_hour = -1; //-1 means dump
+int write_min = 0;
+
 
 int write_display_buffer() {
     int thisret, ret = 0;
@@ -241,10 +253,42 @@ int update_buffer_with_measurements(bool degc,  uint16_t co2ppm, float tC, float
     return res;
 }
 
+void update_buffer_with_write_info() {
+    int nchar;
+    char s[40];
+
+    nchar = sprintf(s, "Write?"); 
+    for (int i=0; i<nchar; i++) { char_to_buffer(s[i], i*8 + (128 - nchar*8)/2, 31); }
+    
+    if (write_hour < 0) {
+        nchar = sprintf(s, "No, dump."); 
+    } else {
+        nchar = sprintf(s, "%i:%i", write_hour, write_min); 
+    }
+    for (int i=0; i<nchar; i++) { char_to_buffer(s[i], i*8 + (128 - nchar*8)/2, 21); }
+}
+
 void buttons_callback(uint gpio, uint32_t events) {
     // only triggered on falling.
-    degc = !degc;
-    redraw = true;
+    // 7=C, 8=B, 9=A
+    if (writing == 1) {
+        switch (gpio) {
+        case 7: // C=min
+            write_min = (write_min + 1) % 61;
+            break;
+        case 8: // B=hour
+            write_hour = (write_hour + 1) % 25;
+            break;
+        case 9: // A=proceed
+            writing = 2;
+            break;
+        }
+    } else if (gpio == 9) {
+        writing = true;
+    } else if (gpio == 7) {
+        degc = !degc;
+        redraw = true;
+    }
 }
 
 bool redraw_timer_callback(struct repeating_timer *t) {
@@ -299,36 +343,74 @@ int main() {
     }
 
     while (true) {
-        if (remeasure) {
-            int res;
-            uint16_t words[3];
-
-            res = scd41_read(0xec05, words, 3, 1);
-            if (res == PICO_ERROR_GENERIC) {
-                printf("measurement error!");
-
-                gpio_put(LED_GPIO, 1);
-                sleep_ms(250);
-                gpio_put(LED_GPIO, 0);
-                sleep_ms(250);
-            } 
-
-            co2ppm = words[0];
-            tempC = 175. * (float)words[1] / 65536. - 45.;
-            rh = 100. * (float)words[2] / 65536.;
-            tdpC = dewpoint_from_t_rh(tempC, rh);
-
-            remeasure = false;
-        }
-
-        if (redraw) {
+        switch (writing) {
+        case 1:
             clear_buffer();
-            update_buffer_with_measurements(degc, co2ppm, tempC, rh, tdpC);
+            update_buffer_with_write_info();
             write_display_buffer();
-            redraw = false;
 
-            uint32_t timestamp = to_ms_since_boot(get_absolute_time());
-            printf("tstampms,CO2ppm,TC,Rh%%,TdpC:%i,%i,%.1f,%.1f,%.1f\n", timestamp, co2ppm, tempC, rh, tdpC);
+            break;
+        case 2:
+            if (write_hour < 0){
+                for (int i=0; i<stored_data_idx; i++) {
+                    // TODO: replace with dumping what was written
+                    printf("tstampms,CO2ppm,TC,Rh%%,TdpC:%i,%i,%.1f,%.1f,%.1f\n", times[i], co2ppms[i], temps[i], rhs[i], tdps[i]);
+                    
+                }
+            } else {
+                uint32_t timestamp = to_ms_since_boot(get_absolute_time());
+                // TODO: write to flash
+                // use write_hour and write_minute as last entry
+            }
+
+            writing = 0;
+            write_hour = -1;
+            write_min = 0;
+            break;
+        case 0:
+            if (remeasure) {
+                int res;
+                uint16_t words[3];
+
+                res = scd41_read(0xec05, words, 3, 1);
+                if (res == PICO_ERROR_GENERIC) {
+                    printf("measurement error!");
+
+                    gpio_put(LED_GPIO, 1);
+                    sleep_ms(250);
+                    gpio_put(LED_GPIO, 0);
+                    sleep_ms(250);
+                } 
+
+                co2ppm = words[0];
+                tempC = 175. * (float)words[1] / 65536. - 45.;
+                rh = 100. * (float)words[2] / 65536.;
+                tdpC = dewpoint_from_t_rh(tempC, rh);
+
+                remeasure = false;
+            }
+
+            if (redraw) {
+                clear_buffer();
+                update_buffer_with_measurements(degc, co2ppm, tempC, rh, tdpC);
+                write_display_buffer();
+                redraw = false;
+
+                uint32_t timestamp = to_ms_since_boot(get_absolute_time());
+
+                if (stored_data_idx >= STORED_DATA_SIZE) {
+                    printf("no space left to store data, outputting");
+                    printf("tstampms,CO2ppm,TC,Rh%%,TdpC:%i,%i,%.1f,%.1f,%.1f\n", timestamp, co2ppm, tempC, rh, tdpC);
+                } else {
+                    times[stored_data_idx] = timestamp;
+                    co2ppms[stored_data_idx] = co2ppm;
+                    temps[stored_data_idx] = tempC;
+                    rhs[stored_data_idx] = rh; 
+                    tdps[stored_data_idx] = tdpC;
+                    stored_data_idx++;
+                }
+            }
+            break;
         }
 
         sleep_ms(SLEEP_TIME_MS);
