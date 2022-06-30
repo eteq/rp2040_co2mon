@@ -36,9 +36,10 @@
 #define CRC_ERROR -10
 
 #define SLEEP_TIME_MS 5
-#define DEBOUNCE_TIME_MS 3
+#define DEBOUNCE_TIME_MS 25
 #define MEASUREMENT_PERIOD_MS 5000
 #define RAM_DATA_MAX_SIZE 5000  //20 bytes per item, so mutiple these by .02 to get the ram usage in kB
+#define REINIT_ERROR_COUNT 3 //number of repeated measurement errors before a re-init is attempted of the scd41
 
 #define FLASH_DATA_STORAGE_OFFSET 0x100000 //1MB
 
@@ -50,19 +51,20 @@ bool redraw = false;
 bool remeasure = false;
 int writing = 0;
 struct repeating_timer redraw_timer;
+int measurement_error_count = 0;
 
 int stored_data_idx = 0;
 
 struct co2mon_data {
     uint32_t time;
-    float co2ppm;
+    uint16_t co2ppm;
     float tempC;
     float rh;
     float tdpC;
 };
 struct co2mon_data stored_data[RAM_DATA_MAX_SIZE + FLASH_PAGE_SIZE/sizeof(struct co2mon_data)]; // extra length is to prevent possible segfault on flash writing
 
-int write_hour = -1; //-1 means dump
+int write_hour = -2; //-2 means do nothing, -1 means dump
 int write_min = 0;
 uint32_t write_timestamp = 0;
 
@@ -151,11 +153,11 @@ int scd41_read(uint16_t code, uint16_t * readinto, size_t nwords, uint32_t cmdti
 
  
     ret = i2c_write_blocking(WHICH_I2C, SCD41_ADDR, wbuffer, 2, true);
-    if (ret == PICO_ERROR_GENERIC) { return ret; }
+    if (ret == PICO_ERROR_GENERIC) { return -1; }
     sleep_ms(cmdtime_ms);
     uint8_t * rbuffer =  malloc(nwords*3);
     ret = i2c_read_blocking(WHICH_I2C, SCD41_ADDR, rbuffer, nwords*3, false);
-    if (ret == PICO_ERROR_GENERIC) { free(rbuffer); return ret; }
+    if (ret == PICO_ERROR_GENERIC) { free(rbuffer); return -2; }
 
     for (int i=0; i < nwords; i++) {
         uint8_t bytes[2];
@@ -163,13 +165,13 @@ int scd41_read(uint16_t code, uint16_t * readinto, size_t nwords, uint32_t cmdti
 
         bytes[0] = rbuffer[j]; // msb
         bytes[1] = rbuffer[j+1]; //lsb
-        if (rbuffer[j+2] != sensirion_common_generate_crc(bytes, 2)) { free(rbuffer); return CRC_ERROR; }
+        if (rbuffer[j+2] != sensirion_common_generate_crc(bytes, 2)) { free(rbuffer); return -3; }
 
         readinto[i] = bytes[1] | (bytes[0] << 8);
     }
 
     free(rbuffer);
-    return ret;
+    return 0;
 }
 
 
@@ -185,6 +187,23 @@ int scd41_sendcommand(uint16_t code, uint32_t cmdtime_ms) {
         sleep_ms(cmdtime_ms);
     }
     return ret;
+}
+
+int scd41_init() {
+    int ret;
+    
+    // stop measuring SCD41 if it is already
+    ret = scd41_sendcommand(0x3f86, 500);
+    if (ret == PICO_ERROR_GENERIC) {return -1;}
+    //re-init just in case it isn't
+    ret = scd41_sendcommand(0x3646, 1020);
+    if (ret == PICO_ERROR_GENERIC) {return -2;}
+
+    //start measuring SCD41
+    ret = scd41_sendcommand(0x21b1, 0);
+    if (ret == PICO_ERROR_GENERIC) {return -3;}
+
+    return 0;
 }
 
 
@@ -271,10 +290,13 @@ void update_buffer_with_write_info() {
     nchar = sprintf(s, "Write?"); 
     for (int i=0; i<nchar; i++) { char_to_buffer(s[i], i*8 + (128 - nchar*8)/2, 31); }
     
-    if (write_hour < 0) {
-        nchar = sprintf(s, "No, dump."); 
+    if (write_hour < -1) {
+        nchar = sprintf(s, "Never mind"); 
+    }
+    else if (write_hour < 0) {
+        nchar = sprintf(s, "Dump + clear RAM"); 
     } else {
-        nchar = sprintf(s, "%i:%i", write_hour, write_min); 
+        nchar = sprintf(s, "Time: %i:%i", write_hour, write_min); 
     }
     for (int i=0; i<nchar; i++) { char_to_buffer(s[i], i*8 + (128 - nchar*8)/2, 21); }
 }
@@ -289,10 +311,15 @@ void buttons_callback(uint gpio, uint32_t events) {
         if (writing == 1) {
             switch (gpio) {
             case 7: // C=min
+                if (write_hour < 0) { write_hour = 0; }
                 write_min = (write_min + 1) % 61;
                 break;
             case 8: // B=hour
-                write_hour = (write_hour + 1) % 25;
+                if (write_hour >= 24) {
+                    write_hour = -2;
+                } else {
+                    write_hour += 1;
+                }
                 break;
             case 9: // A=proceed
                 writing = 2;
@@ -318,6 +345,8 @@ void write_stored_data_to_flash(int ndata, int hour, int min, int timestamp) {
     uint8_t single_page_buffer[FLASH_PAGE_SIZE];
     int total_bytes = ndata * sizeof(stored_data[0]) + FLASH_PAGE_SIZE;
 
+    printf("writing %i data points to flash ...", ndata);
+
     uint32_t ints = save_and_disable_interrupts();
 
     flash_range_erase(FLASH_DATA_STORAGE_OFFSET, (total_bytes/FLASH_SECTOR_SIZE + 1)*FLASH_SECTOR_SIZE);
@@ -330,9 +359,12 @@ void write_stored_data_to_flash(int ndata, int hour, int min, int timestamp) {
     ((int*)single_page_buffer)[3] = timestamp;
     flash_range_program(FLASH_DATA_STORAGE_OFFSET, single_page_buffer, FLASH_PAGE_SIZE);
 
-    flash_range_program(FLASH_DATA_STORAGE_OFFSET, (uint8_t*) stored_data, (ndata * sizeof(stored_data[0]) / FLASH_PAGE_SIZE + 1)*FLASH_PAGE_SIZE);
-
+    flash_range_program(FLASH_DATA_STORAGE_OFFSET + FLASH_PAGE_SIZE, (uint8_t*) stored_data, 
+                        (ndata * sizeof(stored_data[0]) / FLASH_PAGE_SIZE + 1)*FLASH_PAGE_SIZE);
+    
     restore_interrupts (ints);
+    
+    printf(" finished writing to flash\n", ndata);
 }
 
 int restore_stored_data_from_flash() {
@@ -359,7 +391,6 @@ int main() {
     bi_decl(bi_program_description("This is a co2 monitor binary."));
     bi_decl(bi_1pin_with_name(LED_GPIO, "On-board LED"));
 
-    
     uint16_t co2ppm;
     float tempC, rh, tdpC;
 
@@ -383,13 +414,9 @@ int main() {
     clear_buffer();
     write_display_buffer();
 
-    // stop measuring SCD41 if it is already
-    scd41_sendcommand(0x3f86, 500);
-    //re-init just in case it isn't
-    scd41_sendcommand(0x3646, 1020);
+    int init_ret = scd41_init();
+    if (init_ret < 0) {printf("init error:%i!", init_ret);}
 
-    //start measuring SCD41
-    scd41_sendcommand(0x21b1, 0);
     add_repeating_timer_ms(MEASUREMENT_PERIOD_MS, redraw_timer_callback, NULL, &redraw_timer);
 
     // this indicates startup
@@ -409,22 +436,33 @@ int main() {
 
             break;
         case 2:
-            if (write_hour < 0){
+            if (write_hour < -1){
+                //no op - user selected cancel
+                redraw = true;
+            }
+            else if (write_hour < 0){
+                #ifdef DUMP_FROM_MEM 
+                int dump_data_size = stored_data_idx;
+                printf("dumping last dataset from memory\n");
+                #else
                 int dump_data_size = restore_stored_data_from_flash();
                 printf("dumping last dataset from flash\n");
+                stored_data_idx = 0; // reset the data to be stored
+                #endif
+
+                printf("tstampms,CO2ppm,TC,Rh%%,TdpC\n");
                 for (int i=0; i<dump_data_size; i++) {
-                    // TODO: replace with dumping what was written
-                    printf("tstampms,CO2ppm,TC,Rh%%,TdpC:%i,%i,%.1f,%.1f,%.1f\n", 
+                    printf("%i,%i,%.1f,%.1f,%.1f\n", 
                            stored_data[i].time, stored_data[i].co2ppm, stored_data[i].tempC, stored_data[i].rh, stored_data[i].tdpC);
                 }
-                printf("timestamp %i at time: %i:%i\n", write_timestamp, write_hour, write_min);
+                printf("#Timestamp %i at time: %i:%i\n", write_timestamp, write_hour, write_min);
             } else {
                 write_timestamp = to_ms_since_boot(get_absolute_time());
                 write_stored_data_to_flash(stored_data_idx, write_hour, write_min, write_timestamp);
             }
 
             writing = 0;
-            write_hour = -1;
+            write_hour = -2;
             write_min = 0;
             break;
         case 0:
@@ -433,14 +471,33 @@ int main() {
                 uint16_t words[3];
 
                 res = scd41_read(0xec05, words, 3, 1);
-                if (res == PICO_ERROR_GENERIC) {
-                    printf("measurement error!");
+                if (res < 0) {
+                    printf("measurement error:%i!", res);
+                    measurement_error_count += 1;
 
                     gpio_put(LED_GPIO, 1);
                     sleep_ms(250);
                     gpio_put(LED_GPIO, 0);
                     sleep_ms(250);
-                } 
+                } else {
+                    measurement_error_count = 0;
+                }
+
+                if (measurement_error_count >= REINIT_ERROR_COUNT) {
+                    printf("Got %i measurement errors.  Reinitializing.", REINIT_ERROR_COUNT);
+                    init_ret = scd41_init();
+                    measurement_error_count = 0;
+                    if (init_ret < 0) {printf("init error:%i!", init_ret);}
+                    else {
+                        // 3-times blink to indicate successful reinit         
+                        for (int i=0; i < 3; i++) {
+                            gpio_put(LED_GPIO, 1);
+                            sleep_ms(250);
+                            gpio_put(LED_GPIO, 0);
+                            sleep_ms(250);
+                        }
+                    }
+                }
 
                 co2ppm = words[0];
                 tempC = 175. * (float)words[1] / 65536. - 45.;
