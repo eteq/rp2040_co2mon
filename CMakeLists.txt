@@ -22,4 +22,6 @@ target_link_libraries(co2mon
                       hardware_adc
                       hardware_dma
                       hardware_i2c
+                      hardware_flash
+                      hardware_sync
                      )

@@ -9,6 +9,8 @@
 #include "hardware/dma.h"
 #include "hardware/gpio.h"
 #include "hardware/i2c.h"
+#include <hardware/flash.h>
+#include <hardware/sync.h>
 
 #include "font8x8_basic.h"
 #define FONT_WIDTH 8
@@ -34,8 +36,11 @@
 #define CRC_ERROR -10
 
 #define SLEEP_TIME_MS 5
+#define DEBOUNCE_TIME_MS 3
 #define MEASUREMENT_PERIOD_MS 5000
-#define STORED_DATA_SIZE 5000  //20 bytes per item, so mutiple these by .02 to get the ram usage in kB
+#define RAM_DATA_MAX_SIZE 5000  //20 bytes per item, so mutiple these by .02 to get the ram usage in kB
+
+#define FLASH_DATA_STORAGE_OFFSET 0x100000 //1MB
 
 
 // global state
@@ -47,13 +52,19 @@ int writing = 0;
 struct repeating_timer redraw_timer;
 
 int stored_data_idx = 0;
-uint32_t times[STORED_DATA_SIZE];
-float co2ppms[STORED_DATA_SIZE];
-float temps[STORED_DATA_SIZE];
-float rhs[STORED_DATA_SIZE]; 
-float tdps[STORED_DATA_SIZE];
+
+struct co2mon_data {
+    uint32_t time;
+    float co2ppm;
+    float tempC;
+    float rh;
+    float tdpC;
+};
+struct co2mon_data stored_data[RAM_DATA_MAX_SIZE + FLASH_PAGE_SIZE/sizeof(struct co2mon_data)]; // extra length is to prevent possible segfault on flash writing
+
 int write_hour = -1; //-1 means dump
 int write_min = 0;
+uint32_t write_timestamp = 0;
 
 
 int write_display_buffer() {
@@ -268,33 +279,80 @@ void update_buffer_with_write_info() {
     for (int i=0; i<nchar; i++) { char_to_buffer(s[i], i*8 + (128 - nchar*8)/2, 21); }
 }
 
+
+uint32_t last_callback = 0;
 void buttons_callback(uint gpio, uint32_t events) {
-    // only triggered on falling.
-    // 7=C, 8=B, 9=A
-    if (writing == 1) {
-        switch (gpio) {
-        case 7: // C=min
-            write_min = (write_min + 1) % 61;
-            break;
-        case 8: // B=hour
-            write_hour = (write_hour + 1) % 25;
-            break;
-        case 9: // A=proceed
-            writing = 2;
-            break;
+    uint32_t this_callback = to_ms_since_boot(get_absolute_time());
+    if ((this_callback - last_callback) > DEBOUNCE_TIME_MS) {
+        // only triggered on falling.
+        // 7=C, 8=B, 9=A
+        if (writing == 1) {
+            switch (gpio) {
+            case 7: // C=min
+                write_min = (write_min + 1) % 61;
+                break;
+            case 8: // B=hour
+                write_hour = (write_hour + 1) % 25;
+                break;
+            case 9: // A=proceed
+                writing = 2;
+                break;
+            }
+        } else if (gpio == 9) {
+            writing = true;
+        } else if (gpio == 7) {
+            degc = !degc;
+            redraw = true;
         }
-    } else if (gpio == 9) {
-        writing = true;
-    } else if (gpio == 7) {
-        degc = !degc;
-        redraw = true;
     }
+    last_callback = this_callback;
 }
 
 bool redraw_timer_callback(struct repeating_timer *t) {
     redraw = true;
     remeasure = true;
     return true;
+}
+
+void write_stored_data_to_flash(int ndata, int hour, int min, int timestamp) {
+    uint8_t single_page_buffer[FLASH_PAGE_SIZE];
+    int total_bytes = ndata * sizeof(stored_data[0]) + FLASH_PAGE_SIZE;
+
+    uint32_t ints = save_and_disable_interrupts();
+
+    flash_range_erase(FLASH_DATA_STORAGE_OFFSET, (total_bytes/FLASH_SECTOR_SIZE + 1)*FLASH_SECTOR_SIZE);
+    
+    //write the metadata to the first page
+    for (int i=0; i<FLASH_PAGE_SIZE; i++) { single_page_buffer[i] = 0; }
+    ((int*)single_page_buffer)[0] = ndata;
+    ((int*)single_page_buffer)[1] = hour;
+    ((int*)single_page_buffer)[2] = min;
+    ((int*)single_page_buffer)[3] = timestamp;
+    flash_range_program(FLASH_DATA_STORAGE_OFFSET, single_page_buffer, FLASH_PAGE_SIZE);
+
+    flash_range_program(FLASH_DATA_STORAGE_OFFSET, (uint8_t*) stored_data, (ndata * sizeof(stored_data[0]) / FLASH_PAGE_SIZE + 1)*FLASH_PAGE_SIZE);
+
+    restore_interrupts (ints);
+}
+
+int restore_stored_data_from_flash() {
+    // load the stored data from the flash into memory for dumping.  Also restore write_min/write_hour and return ndata
+    uint8_t* flash_data_ptr = (uint8_t* )XIP_BASE;
+    flash_data_ptr += FLASH_DATA_STORAGE_OFFSET;
+
+    // first extract the metadata from the first page
+    int ndata = ((int*)flash_data_ptr)[0];
+    write_hour = ((int*)flash_data_ptr)[1];
+    write_min = ((int*)flash_data_ptr)[2];
+    write_timestamp = ((int*)flash_data_ptr)[3];
+    // skip forward to the first data byte
+    flash_data_ptr += FLASH_PAGE_SIZE;
+
+    for (int i=0; i < ndata; i++) {
+        stored_data[i] = ((struct co2mon_data*)flash_data_ptr)[i];
+    }
+
+    return ndata;
 }
 
 int main() {
@@ -352,15 +410,17 @@ int main() {
             break;
         case 2:
             if (write_hour < 0){
-                for (int i=0; i<stored_data_idx; i++) {
+                int dump_data_size = restore_stored_data_from_flash();
+                printf("dumping last dataset from flash\n");
+                for (int i=0; i<dump_data_size; i++) {
                     // TODO: replace with dumping what was written
-                    printf("tstampms,CO2ppm,TC,Rh%%,TdpC:%i,%i,%.1f,%.1f,%.1f\n", times[i], co2ppms[i], temps[i], rhs[i], tdps[i]);
-                    
+                    printf("tstampms,CO2ppm,TC,Rh%%,TdpC:%i,%i,%.1f,%.1f,%.1f\n", 
+                           stored_data[i].time, stored_data[i].co2ppm, stored_data[i].tempC, stored_data[i].rh, stored_data[i].tdpC);
                 }
+                printf("timestamp %i at time: %i:%i\n", write_timestamp, write_hour, write_min);
             } else {
-                uint32_t timestamp = to_ms_since_boot(get_absolute_time());
-                // TODO: write to flash
-                // use write_hour and write_minute as last entry
+                write_timestamp = to_ms_since_boot(get_absolute_time());
+                write_stored_data_to_flash(stored_data_idx, write_hour, write_min, write_timestamp);
             }
 
             writing = 0;
@@ -387,6 +447,20 @@ int main() {
                 rh = 100. * (float)words[2] / 65536.;
                 tdpC = dewpoint_from_t_rh(tempC, rh);
 
+                uint32_t timestamp = to_ms_since_boot(get_absolute_time());
+
+                if (stored_data_idx >= RAM_DATA_MAX_SIZE) {
+                    printf("no space left to store data, outputting\n");
+                    printf("tstampms,CO2ppm,TC,Rh%%,TdpC:%i,%i,%.1f,%.1f,%.1f\n", timestamp, co2ppm, tempC, rh, tdpC);
+                } else {
+                    stored_data[stored_data_idx].time = timestamp;
+                    stored_data[stored_data_idx].co2ppm = co2ppm;
+                    stored_data[stored_data_idx].tempC = tempC;
+                    stored_data[stored_data_idx].rh = rh;
+                    stored_data[stored_data_idx].tdpC = tdpC;
+                    stored_data_idx++;
+                }
+
                 remeasure = false;
             }
 
@@ -395,20 +469,6 @@ int main() {
                 update_buffer_with_measurements(degc, co2ppm, tempC, rh, tdpC);
                 write_display_buffer();
                 redraw = false;
-
-                uint32_t timestamp = to_ms_since_boot(get_absolute_time());
-
-                if (stored_data_idx >= STORED_DATA_SIZE) {
-                    printf("no space left to store data, outputting");
-                    printf("tstampms,CO2ppm,TC,Rh%%,TdpC:%i,%i,%.1f,%.1f,%.1f\n", timestamp, co2ppm, tempC, rh, tdpC);
-                } else {
-                    times[stored_data_idx] = timestamp;
-                    co2ppms[stored_data_idx] = co2ppm;
-                    temps[stored_data_idx] = tempC;
-                    rhs[stored_data_idx] = rh; 
-                    tdps[stored_data_idx] = tdpC;
-                    stored_data_idx++;
-                }
             }
             break;
         }
