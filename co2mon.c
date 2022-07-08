@@ -64,7 +64,13 @@ struct co2mon_data {
 };
 struct co2mon_data stored_data[RAM_DATA_MAX_SIZE + FLASH_PAGE_SIZE/sizeof(struct co2mon_data)]; // extra length is to prevent possible segfault on flash writing
 
-int write_hour = -2; //-2 means do nothing, -1 means dump
+int write_hour = -2; //0+ means write with that as the hour,  -2 means, -3 means, -4 means , -5 means cancel
+const int WRITE_HOUR_CANCEL = -2;
+const int WRITE_HOUR_DUMP = -1;
+const int WRITE_HOUR_CLEARFLASH = -3;
+const int WRITE_HOUR_CLEARRAM = -4;
+const int WRITE_HOUR_DUMP_RAM = -5;
+const int MAGIC_NUMBER_FLASH = 0xfffffff - 42;
 int write_min = 0;
 uint32_t write_timestamp = 0;
 
@@ -289,13 +295,24 @@ void update_buffer_with_write_info() {
 
     nchar = sprintf(s, "Write?"); 
     for (int i=0; i<nchar; i++) { char_to_buffer(s[i], i*8 + (128 - nchar*8)/2, 31); }
-    
-    if (write_hour < -1) {
+
+    switch(write_hour) {
+    case WRITE_HOUR_CANCEL:
         nchar = sprintf(s, "Never mind"); 
-    }
-    else if (write_hour < 0) {
-        nchar = sprintf(s, "Dump + clear RAM"); 
-    } else {
+        break;
+    case WRITE_HOUR_DUMP:
+        nchar = sprintf(s, "Dump Flash->USB");
+        break;
+    case WRITE_HOUR_DUMP_RAM:
+        nchar = sprintf(s, "Dump RAM->USB");
+        break;
+    case WRITE_HOUR_CLEARFLASH:
+    nchar = sprintf(s, "Clear Flash"); 
+        break;
+    case WRITE_HOUR_CLEARRAM:
+    nchar = sprintf(s, "Clear RAM"); 
+        break;
+    default:
         nchar = sprintf(s, "Time: %i:%i", write_hour, write_min); 
     }
     for (int i=0; i<nchar; i++) { char_to_buffer(s[i], i*8 + (128 - nchar*8)/2, 21); }
@@ -316,7 +333,7 @@ void buttons_callback(uint gpio, uint32_t events) {
                 break;
             case 8: // B=hour
                 if (write_hour >= 24) {
-                    write_hour = -2;
+                    write_hour = -5;
                 } else {
                     write_hour += 1;
                 }
@@ -353,10 +370,11 @@ void write_stored_data_to_flash(int ndata, int hour, int min, int timestamp) {
     
     //write the metadata to the first page
     for (int i=0; i<FLASH_PAGE_SIZE; i++) { single_page_buffer[i] = 0; }
-    ((int*)single_page_buffer)[0] = ndata;
-    ((int*)single_page_buffer)[1] = hour;
-    ((int*)single_page_buffer)[2] = min;
-    ((int*)single_page_buffer)[3] = timestamp;
+    ((int*)single_page_buffer)[0] = MAGIC_NUMBER_FLASH;
+    ((int*)single_page_buffer)[1] = ndata;
+    ((int*)single_page_buffer)[2] = hour;
+    ((int*)single_page_buffer)[3] = min;
+    ((int*)single_page_buffer)[4] = timestamp;
     flash_range_program(FLASH_DATA_STORAGE_OFFSET, single_page_buffer, FLASH_PAGE_SIZE);
 
     flash_range_program(FLASH_DATA_STORAGE_OFFSET + FLASH_PAGE_SIZE, (uint8_t*) stored_data, 
@@ -367,25 +385,43 @@ void write_stored_data_to_flash(int ndata, int hour, int min, int timestamp) {
     printf(" finished writing to flash\n", ndata);
 }
 
-int restore_stored_data_from_flash() {
+void dump_data(struct co2mon_data* data, int len) {
+    printf("tstampms,CO2ppm,TC,Rh%%,TdpC\n");
+    for (int i=0; i < len; i++) {
+        printf("%i,%i,%.1f,%.1f,%.1f\n", 
+                data[i].time, data[i].co2ppm, data[i].tempC, data[i].rh, data[i].tdpC);
+    }
+    printf("#Timestamp %i at time: %i:%i\n", write_timestamp, write_hour, write_min);
+}
+
+int dump_flash_data() {
+    int ndata = 0;
+
     // load the stored data from the flash into memory for dumping.  Also restore write_min/write_hour and return ndata
     uint8_t* flash_data_ptr = (uint8_t* )XIP_BASE;
     flash_data_ptr += FLASH_DATA_STORAGE_OFFSET;
 
     // first extract the metadata from the first page
-    int ndata = ((int*)flash_data_ptr)[0];
-    write_hour = ((int*)flash_data_ptr)[1];
-    write_min = ((int*)flash_data_ptr)[2];
-    write_timestamp = ((int*)flash_data_ptr)[3];
-    // skip forward to the first data byte
-    flash_data_ptr += FLASH_PAGE_SIZE;
-
-    for (int i=0; i < ndata; i++) {
-        stored_data[i] = ((struct co2mon_data*)flash_data_ptr)[i];
+    if (((int*)flash_data_ptr)[0] == MAGIC_NUMBER_FLASH) {
+        ndata = ((int*)flash_data_ptr)[1];
+        write_hour = ((int*)flash_data_ptr)[2];
+        write_min = ((int*)flash_data_ptr)[3];
+        write_timestamp = ((int*)flash_data_ptr)[4];
+        // skip forward to the first data byte
+        flash_data_ptr += FLASH_PAGE_SIZE;
+        
+        dump_data((struct co2mon_data*)flash_data_ptr, ndata);
+    } else {
+        printf("Invalid magic number... nothing saved to flash?\n");
     }
 
     return ndata;
 }
+
+void clear_data_from_flash() {
+    //TODO
+}
+
 
 int main() {
     bi_decl(bi_program_description("This is a co2 monitor binary."));
@@ -436,27 +472,26 @@ int main() {
 
             break;
         case 2:
-            if (write_hour < -1){
-                //no op - user selected cancel
+            switch(write_hour) {
+            case WRITE_HOUR_CANCEL:
+                //no op
                 redraw = true;
-            }
-            else if (write_hour < 0){
-                #ifdef DUMP_FROM_MEM 
-                int dump_data_size = stored_data_idx;
-                printf("dumping last dataset from memory\n");
-                #else
-                int dump_data_size = restore_stored_data_from_flash();
+                break;
+            case WRITE_HOUR_DUMP:
                 printf("dumping last dataset from flash\n");
-                stored_data_idx = 0; // reset the data to be stored
-                #endif
-
-                printf("tstampms,CO2ppm,TC,Rh%%,TdpC\n");
-                for (int i=0; i<dump_data_size; i++) {
-                    printf("%i,%i,%.1f,%.1f,%.1f\n", 
-                           stored_data[i].time, stored_data[i].co2ppm, stored_data[i].tempC, stored_data[i].rh, stored_data[i].tdpC);
-                }
-                printf("#Timestamp %i at time: %i:%i\n", write_timestamp, write_hour, write_min);
-            } else {
+                dump_flash_data();
+                break;
+            case WRITE_HOUR_DUMP_RAM:
+                printf("dumping last dataset from memory:\n");
+                dump_data(stored_data, stored_data_idx);
+                break;
+            case WRITE_HOUR_CLEARFLASH:
+                clear_data_from_flash();
+                break;
+            case WRITE_HOUR_CLEARRAM:
+                stored_data_idx = 0;
+                break;
+            default:
                 write_timestamp = to_ms_since_boot(get_absolute_time());
                 write_stored_data_to_flash(stored_data_idx, write_hour, write_min, write_timestamp);
             }
