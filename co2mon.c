@@ -36,8 +36,12 @@
 #define CRC_ERROR -10
 
 #define SLEEP_TIME_MS 5
-#define DEBOUNCE_TIME_MS 25
+#define DEBOUNCE_TIME_MS 75
+#define BUTTON_HOLD_WAIT_MS 500
+#define BUTTON_HOLD_SPEED_US 40000
+
 #define MEASUREMENT_PERIOD_MS 5000
+
 #define RAM_DATA_MAX_SIZE 5000  //20 bytes per item, so mutiple these by .02 to get the ram usage in kB
 #define REINIT_ERROR_COUNT 3 //number of repeated measurement errors before a re-init is attempted of the scd41
 
@@ -286,6 +290,10 @@ int update_buffer_with_measurements(bool degc,  uint16_t co2ppm, float tC, float
     else { nchar = sprintf(s, "Unsafe CO2!"); }
     for (int i=0; i<nchar; i++) { char_to_buffer(s[i], i*8 + (128 - nchar*8)/2, 41); }
 
+    if (measurement_error_count > 0) {
+        char_to_buffer('!', WIDTH-9, 51);
+    }
+
     return res;
 }
 
@@ -318,38 +326,58 @@ void update_buffer_with_write_info() {
     for (int i=0; i<nchar; i++) { char_to_buffer(s[i], i*8 + (128 - nchar*8)/2, 21); }
 }
 
+void button_pressed(uint gpio) {
+    // do the action of a single button press.  Should be callback/interrupt-compatible
+    // 7=C, 8=B, 9=A
+    if (writing == 1) {
+        switch (gpio) {
+        case 7: // C=min
+            if (write_hour < 0) { write_hour = 0; }
+            write_min = (write_min + 1) % 60;
+            break;
+        case 8: // B=hour
+            if (write_hour >= 23) {
+                write_hour = -5;
+            } else {
+                write_hour += 1;
+            }
+            break;
+        case 9: // A=proceed
+            writing = 2;
+            break;
+        }
+    } else if (gpio == 9) {
+        writing = true;
+    } else if (gpio == 7) {
+        degc = !degc;
+        redraw = true;
+    }
+}
+
+uint button_hold_callback_data[1];
+int64_t button_hold_callback(alarm_id_t id, void *user_data) {
+    uint gpio = * (uint *) user_data;
+    button_pressed(gpio);
+
+    return BUTTON_HOLD_SPEED_US;
+}
+
 
 uint32_t last_callback = 0;
+alarm_id_t hold_alarm_id = -2;
 void buttons_callback(uint gpio, uint32_t events) {
+    if (hold_alarm_id >= 0) { cancel_alarm(hold_alarm_id); }
+
     uint32_t this_callback = to_ms_since_boot(get_absolute_time());
-    if ((this_callback - last_callback) > DEBOUNCE_TIME_MS) {
-        // only triggered on falling.
-        // 7=C, 8=B, 9=A
-        if (writing == 1) {
-            switch (gpio) {
-            case 7: // C=min
-                if (write_hour < 0) { write_hour = 0; }
-                write_min = (write_min + 1) % 61;
-                break;
-            case 8: // B=hour
-                if (write_hour >= 24) {
-                    write_hour = -5;
-                } else {
-                    write_hour += 1;
-                }
-                break;
-            case 9: // A=proceed
-                writing = 2;
-                break;
-            }
-        } else if (gpio == 9) {
-            writing = true;
-        } else if (gpio == 7) {
-            degc = !degc;
-            redraw = true;
+    if ((events & GPIO_IRQ_EDGE_FALL) > 0) {
+        if ((this_callback - last_callback) > DEBOUNCE_TIME_MS) {
+            button_pressed(gpio);
         }
+        last_callback = this_callback;
+        
+        button_hold_callback_data[0] = gpio;
+        hold_alarm_id = add_alarm_in_ms(BUTTON_HOLD_WAIT_MS, button_hold_callback, button_hold_callback_data, true);
     }
-    last_callback = this_callback;
 }
 
 bool redraw_timer_callback(struct repeating_timer *t) {
@@ -419,7 +447,22 @@ int dump_flash_data() {
 }
 
 void clear_data_from_flash() {
-    //TODO
+    // we only need to clear the first page since the writing/dumping process uses the first page to find out where to start
+
+    uint32_t ints = save_and_disable_interrupts();
+    flash_range_erase(FLASH_DATA_STORAGE_OFFSET, FLASH_SECTOR_SIZE); // one sector
+    restore_interrupts (ints);
+
+    //uint32_t ints = save_and_disable_interrupts();
+    //flash_range_erase(FLASH_DATA_STORAGE_OFFSET, (total_bytes/FLASH_SECTOR_SIZE + 1)*FLASH_SECTOR_SIZE);
+    
+    //write the metadata to the first page
+    //for (int i=0; i<FLASH_PAGE_SIZE; i++) { single_page_buffer[i] = 0; }
+    //flash_range_program(FLASH_DATA_STORAGE_OFFSET, single_page_buffer, FLASH_PAGE_SIZE);
+    
+    //restore_interrupts (ints);
+    
+    printf("Cleared flash data\n");
 }
 
 
@@ -442,7 +485,7 @@ int main() {
         gpio_set_dir(pinnum, GPIO_IN);
         gpio_pull_up(pinnum);
         // FALL is when the button is pushed
-        gpio_set_irq_enabled_with_callback(pinnum, GPIO_IRQ_EDGE_FALL, true, &buttons_callback);
+        gpio_set_irq_enabled_with_callback(pinnum, GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE, true, &buttons_callback);
     }
 
     printf("Getting display Ready\n");
@@ -521,9 +564,11 @@ int main() {
                 if (measurement_error_count >= REINIT_ERROR_COUNT) {
                     printf("Got %i measurement errors.  Reinitializing.", REINIT_ERROR_COUNT);
                     init_ret = scd41_init();
-                    measurement_error_count = 0;
-                    if (init_ret < 0) {printf("init error:%i!", init_ret);}
-                    else {
+                    
+                    if (init_ret < 0) {
+                        printf("init error:%i!", init_ret); 
+                        measurement_error_count = 1;
+                    } else {
                         // 3-times blink to indicate successful reinit         
                         for (int i=0; i < 3; i++) {
                             gpio_put(LED_GPIO, 1);
@@ -531,6 +576,7 @@ int main() {
                             gpio_put(LED_GPIO, 0);
                             sleep_ms(250);
                         }
+                        measurement_error_count = 0;
                     }
                 }
 
