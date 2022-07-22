@@ -31,8 +31,6 @@
 
 #define NEOPIXEL_PIN 16
 #define DEFAULT_NPX_BRIGHTNESS 80
-#define DARK_NPX_GPIO_IN 26
-#define DARK_NPX_GPIO_OUT 27
 
 #define DISPLAY_ADDR 0x3c
 #define WIDTH 128
@@ -75,12 +73,15 @@ struct co2mon_data {
 };
 struct co2mon_data stored_data[RAM_DATA_MAX_SIZE + FLASH_PAGE_SIZE/sizeof(struct co2mon_data)]; // extra length is to prevent possible segfault on flash writing
 
-int write_hour = -2; //0+ means write with that as the hour,  -2 means, -3 means, -4 means , -5 means cancel
-const int WRITE_HOUR_CANCEL = -2;
+#define DEFAULT_WRITE_HOUR -3
+#define WRITE_HOUR_LOWEST -6
+int write_hour = DEFAULT_WRITE_HOUR; //0+ means write with that as the hour,  negative are special functions
+const int WRITE_HOUR_CANCEL = -3;
+const int WRITE_HOUR_TOGGLE_NPX = -2;
 const int WRITE_HOUR_DUMP = -1;
-const int WRITE_HOUR_CLEARFLASH = -3;
-const int WRITE_HOUR_CLEARRAM = -4;
-const int WRITE_HOUR_DUMP_RAM = -5;
+const int WRITE_HOUR_CLEARFLASH = -4;
+const int WRITE_HOUR_CLEARRAM = -5;
+const int WRITE_HOUR_DUMP_RAM = -6;
 const int MAGIC_NUMBER_FLASH = 0xfffffff - 42;
 int write_min = 0;
 uint32_t write_timestamp = 0;
@@ -351,6 +352,9 @@ void update_buffer_with_write_info() {
     case WRITE_HOUR_CLEARRAM:
     nchar = sprintf(s, "Clear RAM"); 
         break;
+    case WRITE_HOUR_TOGGLE_NPX:
+    nchar = sprintf(s, "Toggle Light"); 
+        break;
     default:
         nchar = sprintf(s, "Time: %i:%i", write_hour, write_min); 
     }
@@ -368,7 +372,7 @@ void button_pressed(uint gpio) {
             break;
         case 8: // B=hour
             if (write_hour >= 23) {
-                write_hour = -5;
+                write_hour = WRITE_HOUR_LOWEST;
             } else {
                 write_hour += 1;
             }
@@ -536,18 +540,6 @@ int main() {
         gpio_set_irq_enabled_with_callback(pinnum, GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE, true, &buttons_callback);
     }
 
-    
-    // if these two pins are connected, supress the neopixel
-    gpio_init(DARK_NPX_GPIO_IN);
-    gpio_set_dir(DARK_NPX_GPIO_IN, false);
-    gpio_pull_up(DARK_NPX_GPIO_IN);
-    gpio_init(DARK_NPX_GPIO_OUT);
-    gpio_set_dir(DARK_NPX_GPIO_OUT, true);
-    gpio_put(DARK_NPX_GPIO_OUT, 0);
-    if (gpio_get(DARK_NPX_GPIO_IN) ==0) {
-        neopixel_brightness = 0;
-    }
-
     uint neopixel_pio_offset = pio_add_program(neopixel_pio, &ws2812_program);
     ws2812_program_init(neopixel_pio, 0, neopixel_pio_offset, NEOPIXEL_PIN, 800000, false);
     // initialize to red
@@ -601,6 +593,13 @@ int main() {
             case WRITE_HOUR_CLEARRAM:
                 stored_data_idx = 0;
                 break;
+            case WRITE_HOUR_TOGGLE_NPX:
+                if (neopixel_brightness == 0) {
+                    neopixel_brightness = DEFAULT_NPX_BRIGHTNESS;
+                } else {
+                    neopixel_brightness = 0;
+                }
+                break;
             default:
                 write_timestamp = to_ms_since_boot(get_absolute_time());
                 write_stored_data_to_flash(stored_data_idx, write_hour, write_min, write_timestamp, next_open_flash_offset());
@@ -608,20 +607,13 @@ int main() {
             }
 
             writing = 0;
-            write_hour = -2;
+            write_hour = DEFAULT_WRITE_HOUR;
             write_min = 0;
             break;
         case 0:
             if (remeasure) {
                 int res;
                 uint16_t words[3];
-
-                // turn on or off the neopixel based on the pin status
-                if (gpio_get(DARK_NPX_GPIO_IN) ==0) {
-                    neopixel_brightness = 0;
-                } else {
-                    neopixel_brightness = DEFAULT_NPX_BRIGHTNESS;
-                }
 
                 res = scd41_read(0xec05, words, 3, 1);
                 if (res < 0) {
