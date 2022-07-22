@@ -386,15 +386,31 @@ bool redraw_timer_callback(struct repeating_timer *t) {
     return true;
 }
 
-void write_stored_data_to_flash(int ndata, int hour, int min, int timestamp) {
+uint32_t next_open_flash_offset() {
+    uint8_t* flash_data_ptr = (uint8_t* )XIP_BASE;
+    flash_data_ptr += FLASH_DATA_STORAGE_OFFSET;
+
+    int offset = 0;
+    while (((int*)(flash_data_ptr + offset))[0] == MAGIC_NUMBER_FLASH) {
+        int ndata = ((int*)(flash_data_ptr + offset))[1];
+        int nbytes = ((ndata * sizeof(stored_data[0]) + FLASH_PAGE_SIZE)/FLASH_SECTOR_SIZE + 1)*FLASH_SECTOR_SIZE;
+        offset += nbytes;
+    }
+    return offset;
+}
+
+void write_stored_data_to_flash(int ndata, int hour, int min, int timestamp, uint32_t offset) {
     uint8_t single_page_buffer[FLASH_PAGE_SIZE];
     int total_bytes = ndata * sizeof(stored_data[0]) + FLASH_PAGE_SIZE;
+    uint32_t realoffset = FLASH_DATA_STORAGE_OFFSET + offset;
 
-    printf("writing %i data points to flash ...", ndata);
+    printf("writing %i data points to flash at offset %i ...", ndata, offset);
 
     uint32_t ints = save_and_disable_interrupts();
 
-    flash_range_erase(FLASH_DATA_STORAGE_OFFSET, (total_bytes/FLASH_SECTOR_SIZE + 1)*FLASH_SECTOR_SIZE);
+    // The +2 here is because 1 )we want the data, with a minimum of 1, and 
+    // 2) the *next* sector is erased so that if it is read, it won't have the magic number in the metadata header
+    flash_range_erase(realoffset, (total_bytes/FLASH_SECTOR_SIZE + 2)*FLASH_SECTOR_SIZE);
     
     //write the metadata to the first page
     for (int i=0; i<FLASH_PAGE_SIZE; i++) { single_page_buffer[i] = 0; }
@@ -403,10 +419,15 @@ void write_stored_data_to_flash(int ndata, int hour, int min, int timestamp) {
     ((int*)single_page_buffer)[2] = hour;
     ((int*)single_page_buffer)[3] = min;
     ((int*)single_page_buffer)[4] = timestamp;
-    flash_range_program(FLASH_DATA_STORAGE_OFFSET, single_page_buffer, FLASH_PAGE_SIZE);
+    flash_range_program(realoffset, single_page_buffer, FLASH_PAGE_SIZE);
 
-    flash_range_program(FLASH_DATA_STORAGE_OFFSET + FLASH_PAGE_SIZE, (uint8_t*) stored_data, 
+    
+    uint8_t* flash_data_ptr = (uint8_t* )XIP_BASE;
+    flash_data_ptr += realoffset;
+
+    flash_range_program(realoffset + FLASH_PAGE_SIZE, (uint8_t*) stored_data, 
                         (ndata * sizeof(stored_data[0]) / FLASH_PAGE_SIZE + 1)*FLASH_PAGE_SIZE);
+
     
     restore_interrupts (ints);
     
@@ -423,6 +444,7 @@ void dump_data(struct co2mon_data* data, int len) {
 }
 
 int dump_flash_data() {
+    //TODO: implement dumping all the data, not just the first one
     int ndata = 0;
 
     // load the stored data from the flash into memory for dumping.  Also restore write_min/write_hour and return ndata
@@ -452,15 +474,6 @@ void clear_data_from_flash() {
     uint32_t ints = save_and_disable_interrupts();
     flash_range_erase(FLASH_DATA_STORAGE_OFFSET, FLASH_SECTOR_SIZE); // one sector
     restore_interrupts (ints);
-
-    //uint32_t ints = save_and_disable_interrupts();
-    //flash_range_erase(FLASH_DATA_STORAGE_OFFSET, (total_bytes/FLASH_SECTOR_SIZE + 1)*FLASH_SECTOR_SIZE);
-    
-    //write the metadata to the first page
-    //for (int i=0; i<FLASH_PAGE_SIZE; i++) { single_page_buffer[i] = 0; }
-    //flash_range_program(FLASH_DATA_STORAGE_OFFSET, single_page_buffer, FLASH_PAGE_SIZE);
-    
-    //restore_interrupts (ints);
     
     printf("Cleared flash data\n");
 }
@@ -536,7 +549,7 @@ int main() {
                 break;
             default:
                 write_timestamp = to_ms_since_boot(get_absolute_time());
-                write_stored_data_to_flash(stored_data_idx, write_hour, write_min, write_timestamp);
+                write_stored_data_to_flash(stored_data_idx, write_hour, write_min, write_timestamp, next_open_flash_offset());
             }
 
             writing = 0;
