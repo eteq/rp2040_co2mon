@@ -12,6 +12,8 @@
 #include <hardware/flash.h>
 #include <hardware/sync.h>
 
+#include "ws2812.pio.h"
+
 #include "font8x8_basic.h"
 #define FONT_WIDTH 8
 
@@ -26,6 +28,11 @@
 #define WHICH_I2C i2c0
 #endif
 #define I2C_KHZ 400
+
+#define NEOPIXEL_PIN 16
+#define DEFAULT_NPX_BRIGHTNESS 80
+#define DARK_NPX_GPIO_IN 26
+#define DARK_NPX_GPIO_OUT 27
 
 #define DISPLAY_ADDR 0x3c
 #define WIDTH 128
@@ -77,6 +84,21 @@ const int WRITE_HOUR_DUMP_RAM = -5;
 const int MAGIC_NUMBER_FLASH = 0xfffffff - 42;
 int write_min = 0;
 uint32_t write_timestamp = 0;
+
+// for the neopixel
+PIO neopixel_pio = pio0;
+uint8_t neopixel_brightness = DEFAULT_NPX_BRIGHTNESS;
+
+static inline void put_neopixel(uint32_t pixel_grb) {
+    pio_sm_put_blocking(pio0, 0, pixel_grb << 8u);
+}
+
+static inline uint32_t urgb_u32(uint8_t r, uint8_t g, uint8_t b) {
+    return
+            ((uint32_t) (r) << 8) |
+            ((uint32_t) (g) << 16) |
+            (uint32_t) (b);
+}
 
 
 int write_display_buffer() {
@@ -285,9 +307,18 @@ int update_buffer_with_measurements(bool degc,  uint16_t co2ppm, float tC, float
     nchar = sprintf(s, "Tdp: %.1f deg%c", tdp, tchar);
     for (int i=0; i<nchar; i++) { char_to_buffer(s[i], i*8+1, 11); }
 
-    if (co2ppm < 1000) { nchar = sprintf(s, "Safe CO2"); }
-    else if (co2ppm < 2000) { nchar = sprintf(s, "Iffy CO2?"); }
-    else { nchar = sprintf(s, "Unsafe CO2!"); }
+    if (co2ppm < 1000) { 
+        nchar = sprintf(s, "Safe CO2"); 
+        put_neopixel(urgb_u32(0, neopixel_brightness, neopixel_brightness/4));
+        
+    } else if (co2ppm < 2000) { 
+        nchar = sprintf(s, "Iffy CO2?"); 
+        put_neopixel(urgb_u32(neopixel_brightness, neopixel_brightness/2, 0));
+    } else { 
+        nchar = sprintf(s, "Unsafe CO2!"); 
+        put_neopixel(urgb_u32(neopixel_brightness, 0, 0));
+    }
+
     for (int i=0; i<nchar; i++) { char_to_buffer(s[i], i*8 + (128 - nchar*8)/2, 41); }
 
     if (measurement_error_count > 0) {
@@ -505,6 +536,24 @@ int main() {
         gpio_set_irq_enabled_with_callback(pinnum, GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE, true, &buttons_callback);
     }
 
+    
+    // if these two pins are connected, supress the neopixel
+    gpio_init(DARK_NPX_GPIO_IN);
+    gpio_set_dir(DARK_NPX_GPIO_IN, false);
+    gpio_pull_up(DARK_NPX_GPIO_IN);
+    gpio_init(DARK_NPX_GPIO_OUT);
+    gpio_set_dir(DARK_NPX_GPIO_OUT, true);
+    gpio_put(DARK_NPX_GPIO_OUT, 0);
+    if (gpio_get(DARK_NPX_GPIO_IN) ==0) {
+        neopixel_brightness = 0;
+    }
+
+    uint neopixel_pio_offset = pio_add_program(neopixel_pio, &ws2812_program);
+    ws2812_program_init(neopixel_pio, 0, neopixel_pio_offset, NEOPIXEL_PIN, 800000, false);
+    // initialize to red
+    put_neopixel(urgb_u32(neopixel_brightness/2, neopixel_brightness/2, 0));
+
+
     printf("Getting display Ready\n");
     setup_display();
     clear_buffer();
@@ -516,6 +565,7 @@ int main() {
     add_repeating_timer_ms(MEASUREMENT_PERIOD_MS, redraw_timer_callback, NULL, &redraw_timer);
 
     // this indicates startup
+    put_neopixel(urgb_u32(0, 0, neopixel_brightness));
     for (int i=0; i < 5; i++) {
         gpio_put(LED_GPIO, 1);
         sleep_ms(250);
@@ -565,6 +615,13 @@ int main() {
             if (remeasure) {
                 int res;
                 uint16_t words[3];
+
+                // turn on or off the neopixel based on the pin status
+                if (gpio_get(DARK_NPX_GPIO_IN) ==0) {
+                    neopixel_brightness = 0;
+                } else {
+                    neopixel_brightness = DEFAULT_NPX_BRIGHTNESS;
+                }
 
                 res = scd41_read(0xec05, words, 3, 1);
                 if (res < 0) {

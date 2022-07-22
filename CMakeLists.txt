@@ -10,7 +10,11 @@ set(PICO_BOARD adafruit_feather_rp2040)
 
 pico_sdk_init()
 
-add_executable(co2mon co2mon.c)
+add_executable(co2mon)
+
+pico_generate_pio_header(co2mon ${CMAKE_CURRENT_LIST_DIR}/ws2812.pio)
+
+target_sources(co2mon PRIVATE co2mon.c)
 
 pico_enable_stdio_usb(co2mon 1)
 pico_enable_stdio_uart(co2mon 1)
@@ -24,4 +28,5 @@ target_link_libraries(co2mon
                       hardware_i2c
                       hardware_flash
                       hardware_sync
+                      hardware_pio
                      )
