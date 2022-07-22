@@ -427,7 +427,6 @@ void write_stored_data_to_flash(int ndata, int hour, int min, int timestamp, uin
 
     flash_range_program(realoffset + FLASH_PAGE_SIZE, (uint8_t*) stored_data, 
                         (ndata * sizeof(stored_data[0]) / FLASH_PAGE_SIZE + 1)*FLASH_PAGE_SIZE);
-
     
     restore_interrupts (ints);
     
@@ -444,28 +443,33 @@ void dump_data(struct co2mon_data* data, int len) {
 }
 
 int dump_flash_data() {
-    //TODO: implement dumping all the data, not just the first one
-    int ndata = 0;
+    int nsegments = 0;
 
-    // load the stored data from the flash into memory for dumping.  Also restore write_min/write_hour and return ndata
     uint8_t* flash_data_ptr = (uint8_t* )XIP_BASE;
     flash_data_ptr += FLASH_DATA_STORAGE_OFFSET;
 
-    // first extract the metadata from the first page
-    if (((int*)flash_data_ptr)[0] == MAGIC_NUMBER_FLASH) {
-        ndata = ((int*)flash_data_ptr)[1];
+    while (((int*)(flash_data_ptr))[0] == MAGIC_NUMBER_FLASH) {
+        // first extract the metadata from the first page
+        int ndata = ((int*)flash_data_ptr)[1];
         write_hour = ((int*)flash_data_ptr)[2];
         write_min = ((int*)flash_data_ptr)[3];
         write_timestamp = ((int*)flash_data_ptr)[4];
+
         // skip forward to the first data byte
         flash_data_ptr += FLASH_PAGE_SIZE;
         
         dump_data((struct co2mon_data*)flash_data_ptr, ndata);
-    } else {
-        printf("Invalid magic number... nothing saved to flash?\n");
+
+        nsegments += 1;
+
+        flash_data_ptr += ((ndata * sizeof(stored_data[0]) + FLASH_PAGE_SIZE)/FLASH_SECTOR_SIZE + 1)*FLASH_SECTOR_SIZE - FLASH_PAGE_SIZE;
     }
 
-    return ndata;
+    if (nsegments == 0) {
+        printf("Invalid magic number on first segment... nothing saved to flash?\n");
+    }
+
+    return nsegments;
 }
 
 void clear_data_from_flash() {
@@ -534,11 +538,11 @@ int main() {
                 redraw = true;
                 break;
             case WRITE_HOUR_DUMP:
-                printf("dumping last dataset from flash\n");
+                printf("# dumping last dataset from flash\n");
                 dump_flash_data();
                 break;
             case WRITE_HOUR_DUMP_RAM:
-                printf("dumping last dataset from memory:\n");
+                printf("# dumping last dataset from memory:\n");
                 dump_data(stored_data, stored_data_idx);
                 break;
             case WRITE_HOUR_CLEARFLASH:
@@ -550,6 +554,7 @@ int main() {
             default:
                 write_timestamp = to_ms_since_boot(get_absolute_time());
                 write_stored_data_to_flash(stored_data_idx, write_hour, write_min, write_timestamp, next_open_flash_offset());
+                stored_data_idx = 0;
             }
 
             writing = 0;
